@@ -1,0 +1,137 @@
+既然 TVradio 已经能正常播放所有电台，说明智能编码检测方案是有效的。现在我们把同样的逻辑移植到 ljkradio 项目中，让它也能正确显示高清台/热歌台（GBK 编码）和经典台（UTF-8 编码）的元数据。
+
+修改目标
+替换 ljkradio 中 ExoPlayerManager.kt 的简单乱码修复函数 fixMetadataEncoding，改为 TVradio 中成功的 smartFixMetadata 智能编码检测逻辑。
+
+具体修改步骤
+1. 打开文件
+ljkradio/app/src/main/java/com/example/ijkradio/player/ExoPlayerManager.kt
+
+2. 添加必要的导入
+在文件顶部添加 java.nio.charset.Charset 导入：
+
+kotlin
+import java.nio.charset.Charset
+3. 替换 fixMetadataEncoding 函数
+将原有的简单函数：
+
+kotlin
+private fun fixMetadataEncoding(badString: String): String {
+    if (badString.isBlank()) return badString
+    return try {
+        val bytes = badString.toByteArray(Charsets.ISO_8859_1)
+        String(bytes, Charsets.UTF_8)
+    } catch (e: Exception) {
+        badString
+    }
+}
+替换为完整的智能检测函数：
+
+kotlin
+/**
+ * 智能修复元数据编码
+ * 优先尝试 UTF-8，如果解码后无乱码且包含中文则直接使用；
+ * 否则依次尝试 UTF-8、GBK、GB18030，选择中文字符最多的结果
+ */
+private fun smartFixMetadata(badString: String): String {
+    if (badString.isBlank()) return badString
+
+    // 将错误字符串还原为原始字节（ExoPlayer 错误地按 ISO-8859-1 读取）
+    val bytes = badString.toByteArray(Charsets.ISO_8859_1)
+
+    // 1. 优先尝试 UTF-8，并检查解码质量
+    try {
+        val utf8Decoded = String(bytes, Charsets.UTF_8)
+        // 如果解码结果中不包含替换字符 '�'，并且至少有一个中文字符 → 认为是有效的 UTF-8
+        if (!utf8Decoded.contains('�') && utf8Decoded.any { it in '\u4e00'..'\u9fff' }) {
+            Log.d(TAG, "UTF-8 decoding successful: $utf8Decoded")
+            return utf8Decoded
+        }
+        Log.d(TAG, "UTF-8 decoding contains replacement char or no Chinese, fallback")
+    } catch (e: Exception) {
+        Log.w(TAG, "UTF-8 decode failed", e)
+    }
+
+    // 2. 回退到多编码比较（UTF-8、GBK、GB18030）
+    val encodings = listOf(
+        Charsets.UTF_8,
+        Charset.forName("GBK"),
+        Charset.forName("GB18030")
+    )
+
+    var bestResult = badString
+    var bestChineseCount = 0
+
+    for (charset in encodings) {
+        try {
+            val decoded = String(bytes, charset)
+            val chineseCount = decoded.count { it in '\u4e00'..'\u9fff' }
+            if (chineseCount > bestChineseCount) {
+                bestChineseCount = chineseCount
+                bestResult = decoded
+            }
+            Log.d(TAG, "Encoding ${charset.name()}: '$decoded' (Chinese count: $chineseCount)")
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to decode with ${charset.name()}", e)
+        }
+    }
+
+    // 如果最佳结果的中文字符数为0，且原始字符串不是空白，则返回原始字符串（避免强制转换）
+    if (bestChineseCount == 0 && bestResult == badString) {
+        Log.w(TAG, "No Chinese characters found, returning original: $badString")
+    } else {
+        Log.d(TAG, "Best result: '$bestResult' (Chinese count: $bestChineseCount)")
+    }
+
+    return bestResult
+}
+4. 修改 onMetadata 回调中的调用
+找到 ExoPlayerListener 内部的 onMetadata 方法，将：
+
+kotlin
+val fixed = fixMetadataEncoding(rawTitle)
+改为：
+
+kotlin
+val fixed = smartFixMetadata(rawTitle)
+5. （可选）如果 onMediaMetadataChanged 也有元数据处理
+ljkradio 的 ExoPlayerManager 中没有 onMediaMetadataChanged 方法（TVradio 有），所以无需额外修改。
+
+完整修改后的代码段示例
+以下是修改后 ExoPlayerManager.kt 中 ExoPlayerListener 的 onMetadata 部分：
+
+kotlin
+override fun onMetadata(metadata: Metadata) {
+    for (i in 0 until metadata.length()) {
+        val entry = metadata[i]
+        if (entry is IcyInfo) {
+            val rawTitle = entry.title ?: ""
+            val fixed = smartFixMetadata(rawTitle)   // 替换此处
+            if (fixed.isNotBlank()) {
+                _metadataFlow.tryEmit(fixed)
+            }
+        }
+    }
+}
+验证步骤
+在 ljkradio 项目中应用上述修改。
+
+编译运行，测试以下电台：
+
+AsiaFM 高清音乐台 → 应正常显示中文歌曲名（GBK 解码成功）。
+
+AsiaFM 亚洲热歌台 → 应正常显示中文。
+
+AsiaFM 亚洲经典台 → 应正常显示中文（UTF-8 解码成功）。
+
+检查其他电台（如央广系列）的元数据显示是否正常（无副作用）。
+
+兼容性说明
+该修改仅使用 Java/Kotlin 标准库 API（String.getBytes、Charset.forName），完全兼容 Android SDK 19。
+
+不引入任何新依赖。
+
+保留了原有的日志输出，方便调试。
+
+总结
+通过移植 TVradio 中验证有效的智能编码检测逻辑，ljkradio 将能够同时支持 UTF-8 和 GBK/GB18030 编码的元数据，彻底解决高清台/热歌台乱码的问题。修改量小，风险低，建议立即应用。

@@ -16,6 +16,7 @@ import com.google.android.exoplayer2.source.ProgressiveMediaSource
 import com.google.android.exoplayer2.source.hls.HlsMediaSource
 import com.google.android.exoplayer2.upstream.DefaultDataSourceFactory
 import com.google.android.exoplayer2.util.Util
+import java.nio.charset.Charset
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -224,17 +225,61 @@ class ExoPlayerManager private constructor(private val context: Context) {
     // ==================== 乱码修复函数 ====================
 
     /**
-     * 修复 ICY 元数据中的中文乱码。
-     * 原理：将错误地按 ISO-8859-1 读取的字符串还原为原始字节，再按 UTF-8 解码。
+     * 智能修复元数据编码
+     * 优先尝试 UTF-8，如果解码后无乱码且包含中文则直接使用；
+     * 否则依次尝试 UTF-8、GBK、GB18030，选择中文字符最多的结果
      */
-    private fun fixMetadataEncoding(badString: String): String {
+    private fun smartFixMetadata(badString: String): String {
         if (badString.isBlank()) return badString
-        return try {
-            val bytes = badString.toByteArray(Charsets.ISO_8859_1)
-            String(bytes, Charsets.UTF_8)
+
+        // 将错误字符串还原为原始字节（ExoPlayer 错误地按 ISO-8859-1 读取）
+        val bytes = badString.toByteArray(Charsets.ISO_8859_1)
+
+        // 1. 优先尝试 UTF-8，并检查解码质量
+        try {
+            val utf8Decoded = String(bytes, Charsets.UTF_8)
+            // 如果解码结果中不包含替换字符 '�'，并且至少有一个中文字符 → 认为是有效的 UTF-8
+            if (!utf8Decoded.contains('�') && utf8Decoded.any { it in '\u4e00'..'\u9fff' }) {
+                Log.d(TAG, "UTF-8 decoding successful: $utf8Decoded")
+                return utf8Decoded
+            }
+            Log.d(TAG, "UTF-8 decoding contains replacement char or no Chinese, fallback")
         } catch (e: Exception) {
-            badString
+            Log.w(TAG, "UTF-8 decode failed", e)
         }
+
+        // 2. 回退到多编码比较（UTF-8、GBK、GB18030）
+        val encodings = listOf(
+            Charsets.UTF_8,
+            Charset.forName("GBK"),
+            Charset.forName("GB18030")
+        )
+
+        var bestResult = badString
+        var bestChineseCount = 0
+
+        for (charset in encodings) {
+            try {
+                val decoded = String(bytes, charset)
+                val chineseCount = decoded.count { it in '\u4e00'..'\u9fff' }
+                if (chineseCount > bestChineseCount) {
+                    bestChineseCount = chineseCount
+                    bestResult = decoded
+                }
+                Log.d(TAG, "Encoding ${charset.name()}: '$decoded' (Chinese count: $chineseCount)")
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to decode with ${charset.name()}", e)
+            }
+        }
+
+        // 如果最佳结果的中文字符数为0，且原始字符串不是空白，则返回原始字符串（避免强制转换）
+        if (bestChineseCount == 0 && bestResult == badString) {
+            Log.w(TAG, "No Chinese characters found, returning original: $badString")
+        } else {
+            Log.d(TAG, "Best result: '$bestResult' (Chinese count: $bestChineseCount)")
+        }
+
+        return bestResult
     }
 
     // ==================== 内部监听器实现 ====================
@@ -272,7 +317,7 @@ class ExoPlayerManager private constructor(private val context: Context) {
                 val entry = metadata[i]
                 if (entry is IcyInfo) {
                     val rawTitle = entry.title ?: ""
-                    val fixed = fixMetadataEncoding(rawTitle)
+                    val fixed = smartFixMetadata(rawTitle)
                     if (fixed.isNotBlank()) {
                         _metadataFlow.tryEmit(fixed)
                     }
